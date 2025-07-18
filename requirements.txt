@@ -1,0 +1,8 @@
+miditoolkit==0.1.16
+pretty_midi==0.2.10
+numpy==1.26.4
+tqdm>=4.60.0
+scipy>=1.8.0
+matplotlib>=3.0.0
+pandas == 2.3.0
+torch == 2.2.2
