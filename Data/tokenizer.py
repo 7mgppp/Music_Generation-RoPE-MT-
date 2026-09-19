@@ -1,95 +1,102 @@
-from miditoolkit import MidiFile
+"""
+MIDI Tokenizer for Music Generation (RoPE-MT)
+Converts MIDI files into event token sequences and vice versa.
+"""
+
 from pathlib import Path
-from tqdm import tqdm
+from typing import List, Optional, Union, Tuple, Dict
 import json
 
-
-# Constants
-VELOCITY_BINS = 32
-MAX_SHIFT_MS = 10000
-SHIFT_STEP_MS = 50
-BOS_TOKEN = "[BOS]"
-EOS_TOKEN = "[EOS]"
-PAD_TOKEN = "[PAD]"
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, *args, **kwargs):
+        return iterable
 
 
-def velocity_to_bin(vel):
-    bin_size = 128 // VELOCITY_BINS
-    return min(VELOCITY_BINS - 1, max(0, vel // bin_size))
+from Data.vocab import (
+    MusicVocab,
+    PAD_TOKEN,
+    BOS_TOKEN,
+    EOS_TOKEN,
+    UNK_TOKEN,
+    VELOCITY_BINS,
+    MAX_SHIFT_MS,
+    SHIFT_STEP_MS,
+    velocity_to_bin,
+    quantize_time,
+)
 
 
-def quantize_time(delta):
-    steps = max(1, round(delta / SHIFT_STEP_MS))
-    quantized = steps * SHIFT_STEP_MS
-    return min(MAX_SHIFT_MS, quantized)
-
-
-# Fixed midi_to_tokens function
-def midi_to_tokens(midi: MidiFile):
+def extract_events_from_notes(
+    notes: List[Dict[str, int]],
+    sustain_events: Optional[List[Dict[str, int]]] = None
+) -> List[Tuple[int, str, int, int]]:
+    """
+    Given a list of note dicts {'pitch': int, 'start': int, 'end': int, 'velocity': int}
+    and optional sustain pedal events {'time': int, 'value': int},
+    return sorted unified time events: (time_ms, event_type, pitch/value, velocity)
+    """
     events = []
-    active_notes = {}  # active notes to prevent dangling NOTE_OFFs
+    if sustain_events:
+        for cc in sustain_events:
+            val = 127 if cc.get('value', 0) >= 64 else 0
+            events.append((int(cc['time']), 'SUSTAIN', val, 0))
 
-    for inst in midi.instruments:
-        if inst.is_drum:
-            continue
+    for note in notes:
+        pitch = int(note['pitch'])
+        vel = int(note['velocity'])
+        start = int(note['start'])
+        end = max(start + SHIFT_STEP_MS, int(note['end']))
 
-        # Process notes
-        for note in inst.notes:
-            events.append((note.start, 'NOTE_ON', note.pitch, note.velocity))
-            events.append((note.end, 'NOTE_OFF', note.pitch))
-            active_notes[note.pitch] = False  # Initialize note state
+        events.append((start, 'NOTE_ON', pitch, vel))
+        events.append((end, 'NOTE_OFF', pitch, 0))
 
-        # Process sustain pedals (CC64)
-        for cc in inst.control_changes:
-            if cc.number == 64:  # Sustain pedal
-                value = 127 if cc.value >= 64 else 0
-                events.append((cc.time, 'SUSTAIN', value))
+    # Priority at identical timestamp: SUSTAIN (0) -> NOTE_OFF (1) -> NOTE_ON (2)
+    priority = {'SUSTAIN': 0, 'NOTE_OFF': 1, 'NOTE_ON': 2}
+    events.sort(key=lambda x: (x[0], priority.get(x[1], 3)))
+    return events
 
-    # Sort by time, then by event type priority
-    events.sort(key=lambda x: (x[0], {'SUSTAIN': 0, 'NOTE_OFF': 1, 'NOTE_ON': 2}.get(x[1], 3)))
 
+def events_to_tokens(events: List[Tuple[int, str, int, int]]) -> List[str]:
+    """Convert sorted raw time events into token representation."""
     tokens = [BOS_TOKEN]
     last_time = 0
-    sustain_active = False
+    active_notes: Dict[int, bool] = {}
 
-    for event in events:
-        time, event_type, *values = event
-
-        # Handle time shift
-        delta = time - last_time
+    for time_ms, event_type, value1, value2 in events:
+        delta = time_ms - last_time
         if delta > 0:
-            q_delta = quantize_time(delta)
-            tokens.append(f"SHIFT_{int(q_delta)}")  # Convert to int for consistent formatting
-            last_time = time
+            while delta > MAX_SHIFT_MS:
+                tokens.append(f"SHIFT_{MAX_SHIFT_MS}")
+                delta -= MAX_SHIFT_MS
+            if delta > 0:
+                q_delta = quantize_time(delta)
+                tokens.append(f"SHIFT_{q_delta}")
+            last_time = time_ms
 
-        # Handle events
-        if event_type == "NOTE_ON":
-            pitch, velocity = values
+        if event_type == 'NOTE_ON':
+            pitch, velocity = value1, value2
             if active_notes.get(pitch, False):
-                # Turn off previous instance of same pitch before turning on new one
                 tokens.append(f"NOTE_{pitch}_OFF")
             vel_bin = velocity_to_bin(velocity)
             tokens.append(f"NOTE_{pitch}_ON")
             tokens.append(f"VEL_{vel_bin}")
             active_notes[pitch] = True
 
-        elif event_type == "NOTE_OFF":
-            pitch = values[0]
+        elif event_type == 'NOTE_OFF':
+            pitch = value1
             if active_notes.get(pitch, False):
                 tokens.append(f"NOTE_{pitch}_OFF")
                 active_notes[pitch] = False
-            # Else: note wasn't active, skip to avoid dangling NOTE_OFF
 
-        elif event_type == "SUSTAIN":
-            value = values[0]
-            if value == 127:
+        elif event_type == 'SUSTAIN':
+            if value1 >= 64 or value1 == 127:
                 tokens.append("SUSTAIN_ON")
-                sustain_active = True
             else:
                 tokens.append("SUSTAIN_OFF")
-                sustain_active = False
 
-    # Turn off any remaining active notes before EOS
+    # Close remaining open notes
     for pitch, is_active in active_notes.items():
         if is_active:
             tokens.append(f"NOTE_{pitch}_OFF")
@@ -98,74 +105,86 @@ def midi_to_tokens(midi: MidiFile):
     return tokens
 
 
-def save_tokens(tokens, path):
-    with open(path, "w") as f:
+def midi_to_tokens(midi_source: Union[str, Path, object]) -> List[str]:
+    """
+    Parse a MIDI file or miditoolkit MidiFile object into tokens.
+    """
+    notes = []
+    pedals = []
+
+    # If it's a miditoolkit MidiFile instance or file path
+    if isinstance(midi_source, (str, Path)):
+        try:
+            from miditoolkit import MidiFile
+            midi = MidiFile(str(midi_source))
+        except ImportError:
+            # Fallback or raise informative error
+            raise ImportError("miditoolkit is required to load MIDI files. Install with: pip install miditoolkit")
+    else:
+        midi = midi_source
+
+    # Extract notes and control changes
+    for inst in midi.instruments:
+        if getattr(inst, 'is_drum', False):
+            continue
+        for note in inst.notes:
+            notes.append({
+                'pitch': note.pitch,
+                'velocity': note.velocity,
+                'start': note.start,
+                'end': note.end
+            })
+        for cc in getattr(inst, 'control_changes', []):
+            if cc.number == 64:
+                pedals.append({
+                    'time': cc.time,
+                    'value': cc.value
+                })
+
+    events = extract_events_from_notes(notes, pedals)
+    return events_to_tokens(events)
+
+
+def save_tokens(tokens: List[str], output_path: Union[str, Path]):
+    """Save token list to text file."""
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(tokens))
 
 
-def build_vocabulary(token_dir):
-    token_files = list(Path(token_dir).glob("*.txt"))
-    if not token_files:
-        print("No token files found!")
-        return {}
+def load_tokens(input_path: Union[str, Path]) -> List[str]:
+    """Load token list from text file."""
+    with open(input_path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
 
-    vocab_counter = {}
 
-    for f in token_files:
-        with open(f, 'r') as file:
-            tokens = file.read().splitlines()
-            for token in tokens:
-                vocab_counter[token] = vocab_counter.get(token, 0) + 1
+def tokenize_directory(
+    input_dir: Union[str, Path],
+    output_dir: Union[str, Path],
+    vocab_output_path: Optional[Union[str, Path]] = None
+) -> MusicVocab:
+    """Tokenize all MIDI files in input_dir and optionally build vocabulary."""
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create vocabulary with special tokens
-    vocab = {
-        PAD_TOKEN: 0,
-        BOS_TOKEN: 1,
-        EOS_TOKEN: 2,
-        "[UNK]": 3
-    }
+    midi_files = sorted(list(input_dir.rglob("*.mid")) + list(input_dir.rglob("*.midi")))
+    print(f"Found {len(midi_files)} MIDI files in {input_dir}")
 
-    # Add musical tokens (filter rare tokens)
-    idx = len(vocab)
-    for token, count in vocab_counter.items():
-        if token not in vocab and count >= 5:
-            vocab[token] = idx
-            idx += 1
+    token_files = []
+    for f in tqdm(midi_files, desc="Tokenizing"):
+        try:
+            tokens = midi_to_tokens(f)
+            save_path = output_dir / f"{f.stem}.txt"
+            save_tokens(tokens, save_path)
+            token_files.append(save_path)
+        except Exception as e:
+            print(f"Failed on {f.name}: {e}")
+
+    vocab = MusicVocab.build_from_files(token_files)
+    if vocab_output_path:
+        vocab.save(vocab_output_path)
+        print(f"Saved vocabulary to {vocab_output_path} (size: {len(vocab)})")
 
     return vocab
-
-
-if __name__ == "__main__":
-    midi_dir = Path("/Users/miilee/Desktop/maestro-v3.0.0")
-    out_dir = Path("../OutputFiles/google_tokens")
-    vocab_dir = Path("../OutputFiles/vocab")
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    vocab_dir.mkdir(parents=True, exist_ok=True)
-
-    files = sorted(list(midi_dir.rglob("*.mid")) + list(midi_dir.rglob("*.midi")))
-    if not files:
-        print("No MIDI files found.")
-        exit()
-
-    print(f"Found {len(files)} MIDI files.")
-    for f in tqdm(files, desc="Tokenizing", unit="file"):
-        try:
-            midi = MidiFile(f)
-            if not midi.instruments:
-                continue
-            tokens = midi_to_tokens(midi)
-            save_path = out_dir / f"{f.stem}.txt"
-            save_tokens(tokens, save_path)
-        except Exception as e:
-            print(f"Failed on {f.name}: {str(e)}")
-            continue
-
-    # Build vocabulary
-    vocab = build_vocabulary(out_dir)
-    vocab_path = vocab_dir / "vocab.json"
-    with open(vocab_path, "w") as f:
-        json.dump(vocab, f, indent=2)
-
-    print(f"Tokenized {len(list(out_dir.glob('*.txt')))} files")
-    print(f"Vocabulary size: {len(vocab)}")

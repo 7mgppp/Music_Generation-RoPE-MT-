@@ -34,5 +34,8 @@ def create_reverse_vocab(vocab_path, output_path=None):
 
 
 if __name__ == "__main__":
-    VOCAB_PATH = Path("/Users/miilee/PycharmProjects/Music Genration/OutputFiles/vocab/vocab.json")
-    create_reverse_vocab(VOCAB_PATH)
+    default_vocab = Path(__file__).resolve().parent.parent / "vocab" / "vocab.json"
+    if default_vocab.exists():
+        create_reverse_vocab(default_vocab)
+    else:
+        print(f"Vocab file not found at {default_vocab}")

@@ -2,6 +2,15 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.DS_Store
+.idea/
+.vscode/
+checkpoints/
+*.pt
+*.pth
+*.mid
+generated_tokens.txt
+
 
 # C extensions
 *.so
