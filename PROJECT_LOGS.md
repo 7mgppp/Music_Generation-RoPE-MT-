@@ -104,10 +104,44 @@ This document tracks all changes, bug fixes, module implementations, architectur
 ---
 
 ## 📅 Stage 4: Training Pipeline (`train.py`)
-*Status: Pending*
+*Status: Completed & Verified*
 
+### 1. Key Implementations & Features
+- **Device Support**: Automatic selection across `CUDA -> MPS (Apple Silicon) -> CPU` with `PYTORCH_ENABLE_MPS_FALLBACK=1`.
+- **Training Constraints & Defaults**:
+  - FP32 precision by default without GradScaler or torch.compile.
+  - `num_workers=0`, `pin_memory=False` for maximum stability and low overhead.
+  - Default architecture config: `n_layers=6`, `d_model=512`, `n_heads=8`, `d_ff=2048`, `seq_len=512`, `batch_size=8`, `grad_accum=4`.
+- **Optimization & Scheduling**:
+  - Optimizer: `AdamW` with weight decay 0.01, betas (0.9, 0.98).
+  - Scheduler: Linear Warmup (500 steps) followed by Cosine Annealing decay down to minimum learning rate.
+  - Gradient clipping: Max norm $1.0$ (`torch.nn.utils.clip_grad_norm_`).
+- **Loss Computation & Memory Optimization**:
+  - Cross-Entropy Loss with `ignore_index=-100`.
+  - Loss is accumulated on-device as a detached tensor without host `.item()` synchronization on every step.
+- **Logging & Checkpointing**:
+  - Logs training loss every 50 steps.
+  - Evaluates validation loss and perplexity ($\text{PPL} = \exp(\text{val\_loss})$) every 500 steps and appends to `checkpoints/train_log.csv`.
+  - Saves full training state checkpoint every 500 steps (`model_state_dict`, `optimizer_state_dict`, `scheduler_state_dict`, `step`, `config`) and tracks `best_model.pt`.
+  - Generates a sample `.mid` composition every 2,000 steps using `ids_to_midi()`.
+
+### 2. Verification & Overfit Test (`--overfit_batch`)
+- **Initial Loss Sanity Check**:
+  - Initial Loss on real batch: **5.8185**
+  - Theoretical $\ln(\text{vocab\_size}) = \ln(319) = \mathbf{5.7652}$
+  - Difference: **0.0533** (confirms uniform random initialization across vocabulary without bias).
+- **Single Batch Memorization Convergence**:
+  - Step 001: Loss = **5.8438**
+  - Step 025: Loss = **1.4708**
+  - Step 050: Loss = **0.5572**
+  - Step 075: Loss = **0.0747**
+  - Step 100: Loss = **0.0257**
+  - Step 150: Loss = **0.0152**
+  - Result: ✅ Overfit test passed, driving loss to $0.0152$.
+  - Sample generated and saved to: `checkpoints/samples/sample_overfit.mid`.
 
 ---
 
-## 📅 Stage 5: Generation CLI & Documentation
+## 📅 Stage 5: Inference CLI, Generation Script & Documentation
 *Status: Pending*
+

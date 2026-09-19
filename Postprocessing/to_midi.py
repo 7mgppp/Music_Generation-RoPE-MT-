@@ -156,9 +156,10 @@ def tokens_to_midi(
     notes, pedals = tokens_to_events(tokens)
 
     midi_obj = MidiFile(ticks_per_beat=ticks_per_beat)
-    midi_obj.tempo_changes = [TempoChange(bpm=bpm, time=0)]
+    midi_obj.tempo_changes = [TempoChange(bpm, 0)]
 
     inst = Instrument(program=0, is_drum=False, name="Piano")
+
     for n in notes:
         inst.notes.append(Note(
             pitch=n['pitch'],
