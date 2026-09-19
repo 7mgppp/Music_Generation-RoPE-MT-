@@ -3,7 +3,14 @@ Token to MIDI Converter for Music Generation (RoPE-MT)
 Converts token sequences back into playable standard MIDI files.
 """
 
+import numpy as np
+if not hasattr(np, "int"):
+    np.int = int  # NumPy 1.20+ compatibility shim for miditoolkit
+if not hasattr(np, "float"):
+    np.float = float
+
 from pathlib import Path
+
 from typing import List, Union, Optional, Dict, Tuple
 import argparse
 

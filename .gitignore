@@ -9,7 +9,13 @@ checkpoints/
 *.pt
 *.pth
 *.mid
+*.zip
 generated_tokens.txt
+Data/raw/
+Data/tokenized/
+data/raw/
+data/tokenized/
+
 
 
 # C extensions

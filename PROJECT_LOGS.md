@@ -77,13 +77,35 @@ This document tracks all changes, bug fixes, module implementations, architectur
 
 ---
 
-## 📅 Stage 3: Dataset Pipeline (`Data/dataset.py`)
-*Status: Pending*
+## 📅 Stage 3: Dataset Tokenization & PyTorch Pipeline
+*Status: Completed & Tested*
+
+### 1. Key Objectives & Implementations
+- **Preprocessing CLI (`Preprocessing/tokenize_dataset.py`)**:
+  - Implemented command-line interface supporting `--midi_dir Data/raw --out_dir Data/tokenized --vocab_out vocab/vocab.json`.
+  - Added automatic detection and parsing of MAESTRO metadata (`maestro-v3.0.0.json` / `maestro-v3.0.0.csv`).
+  - Added NumPy 1.20+ compatibility shims (`np.int = int`, `np.float = float`) for `miditoolkit`.
+  - Tokenized all **1,276 MAESTRO MIDI files** (0 failures):
+    - `train/`: **962** pieces
+    - `validation/`: **137** pieces
+    - `test/`: **177** pieces
+- **PyTorch Dataset (`Data/dataset.py`)**:
+  - Implemented `MusicDataset` with sliding-window chunking into $(x, y)$ next-token pairs.
+  - Automatically aligns targets ($y_t = x_{t+1}$) and masks `[PAD]` targets with `-100` for PyTorch cross-entropy loss.
+  - Implemented `collate_music_batch()` and `create_music_dataloaders()`.
+  - Validated DataLoader generation over the full tokenized dataset:
+    - Train batches: **10,465** (seq_len=512, batch_size=8 $\approx 43\text{M}$ tokens)
+    - Val batches: **1,192**
+    - Test batches: **1,370**
+- **Automated Tests (`tests/test_dataset.py`)**:
+  - ✅ **Test 1**: Sequence chunking, target alignment, and padding mask verification.
+  - ✅ **Test 2**: Multi-batch DataLoader iteration.
 
 ---
 
 ## 📅 Stage 4: Training Pipeline (`train.py`)
 *Status: Pending*
+
 
 ---
 

@@ -3,7 +3,14 @@ MIDI Tokenizer for Music Generation (RoPE-MT)
 Converts MIDI files into event token sequences and vice versa.
 """
 
+import numpy as np
+if not hasattr(np, "int"):
+    np.int = int  # NumPy 1.20+ compatibility shim for miditoolkit
+if not hasattr(np, "float"):
+    np.float = float
+
 from pathlib import Path
+
 from typing import List, Optional, Union, Tuple, Dict
 import json
 
@@ -188,3 +195,14 @@ def tokenize_directory(
         print(f"Saved vocabulary to {vocab_output_path} (size: {len(vocab)})")
 
     return vocab
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Tokenize MIDI directory")
+    parser.add_argument("--midi_dir", type=str, default="Data/raw", help="Path to raw MIDI directory")
+    parser.add_argument("--out_dir", type=str, default="Data/tokenized", help="Path to output token directory")
+    parser.add_argument("--vocab_out", type=str, default="vocab/vocab.json", help="Path to save vocabulary JSON")
+    args = parser.parse_args()
+
+    tokenize_directory(args.midi_dir, args.out_dir, args.vocab_out)
