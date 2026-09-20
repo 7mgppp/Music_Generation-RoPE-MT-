@@ -56,7 +56,7 @@ Music_Generation-RoPE-MT-/
 
 ---
 
-## ⚡ Installation & Setup
+##  Installation & Setup
 
 1. **Clone the repository:**
    ```bash
@@ -73,7 +73,7 @@ Music_Generation-RoPE-MT-/
 
 ---
 
-## 🎹 Quick Start: Music Generation
+##  Quick Start: Music Generation
 
 Generate a piece using the trained model checkpoint:
 
