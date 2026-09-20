@@ -10,7 +10,6 @@ if not hasattr(np, "float"):
     np.float = float
 
 from pathlib import Path
-
 from typing import List, Optional, Union, Tuple, Dict
 import json
 
@@ -46,9 +45,15 @@ def extract_events_from_notes(
     """
     events = []
     if sustain_events:
-        for cc in sustain_events:
-            val = 127 if cc.get('value', 0) >= 64 else 0
-            events.append((int(cc['time']), 'SUSTAIN', val, 0))
+        # Sort sustain events by timestamp and deduplicate state transitions
+        sorted_cc = sorted(sustain_events, key=lambda x: int(x.get('time', 0)))
+        pedal_state = False
+        for cc in sorted_cc:
+            new_state = (cc.get('value', 0) >= 64)
+            if new_state != pedal_state:
+                pedal_state = new_state
+                val = 127 if pedal_state else 0
+                events.append((int(cc['time']), 'SUSTAIN', val, 0))
 
     for note in notes:
         pitch = int(note['pitch'])
@@ -70,6 +75,7 @@ def events_to_tokens(events: List[Tuple[int, str, int, int]]) -> List[str]:
     tokens = [BOS_TOKEN]
     last_time = 0
     active_notes: Dict[int, bool] = {}
+    pedal_active: bool = False
 
     for time_ms, event_type, value1, value2 in events:
         delta = time_ms - last_time
@@ -98,15 +104,17 @@ def events_to_tokens(events: List[Tuple[int, str, int, int]]) -> List[str]:
                 active_notes[pitch] = False
 
         elif event_type == 'SUSTAIN':
-            if value1 >= 64 or value1 == 127:
-                tokens.append("SUSTAIN_ON")
-            else:
-                tokens.append("SUSTAIN_OFF")
+            new_pedal = (value1 >= 64 or value1 == 127)
+            if new_pedal != pedal_active:
+                pedal_active = new_pedal
+                tokens.append("SUSTAIN_ON" if pedal_active else "SUSTAIN_OFF")
 
-    # Close remaining open notes
+    # Close remaining open notes and pedal before EOS
     for pitch, is_active in active_notes.items():
         if is_active:
             tokens.append(f"NOTE_{pitch}_OFF")
+    if pedal_active:
+        tokens.append("SUSTAIN_OFF")
 
     tokens.append(EOS_TOKEN)
     return tokens
@@ -125,7 +133,6 @@ def midi_to_tokens(midi_source: Union[str, Path, object]) -> List[str]:
             from miditoolkit import MidiFile
             midi = MidiFile(str(midi_source))
         except ImportError:
-            # Fallback or raise informative error
             raise ImportError("miditoolkit is required to load MIDI files. Install with: pip install miditoolkit")
     else:
         midi = midi_source
