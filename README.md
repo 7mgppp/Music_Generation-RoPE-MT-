@@ -8,7 +8,7 @@ An autoregressive, decoder-only Transformer architecture equipped with **Rotary 
 
 ---
 
-## 🌟 Key Features
+##  Key Features
 
 - **RoPE Attention**: Incorporates Rotary Position Embeddings directly into query/key projections for enhanced long-range relative temporal modeling.
 - **Event-Based Token Vocabulary (319 tokens)**:
@@ -25,7 +25,7 @@ An autoregressive, decoder-only Transformer architecture equipped with **Rotary 
 
 ---
 
-## 📁 Repository Structure
+##  Repository Structure
 
 ```
 Music_Generation-RoPE-MT-/
@@ -100,7 +100,7 @@ python generate.py \
 
 ---
 
-## 🏋️ Training the Model
+##  Training the Model
 
 ### 1. Preprocess & Tokenize MIDI Data
 ```bash
@@ -128,7 +128,7 @@ python train.py \
 
 ---
 
-## 🧪 Running Automated Tests
+##  Running Automated Tests
 
 Run the test suite to verify the tokenizer, vocabulary, and model architecture:
 
@@ -138,6 +138,6 @@ pytest tests/
 
 ---
 
-## 📜 License
+##  License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
