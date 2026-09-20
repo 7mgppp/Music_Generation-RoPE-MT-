@@ -51,16 +51,20 @@ def get_cosine_schedule_with_warmup(
     num_training_steps: int,
     min_lr_ratio: float = 0.1
 ) -> LambdaLR:
-    """Linear warmup followed by cosine annealing decay."""
+    """Linear warmup followed by cosine annealing decay down to min_lr at final step."""
+    num_warmup_steps = max(1, num_warmup_steps)
+    num_training_steps = max(num_warmup_steps + 1, num_training_steps)
+
     def lr_lambda(current_step: int) -> float:
         if current_step < num_warmup_steps:
-            return float(current_step + 1) / float(max(1, num_warmup_steps))
-        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+            return float(current_step + 1) / float(num_warmup_steps)
+        progress = float(current_step - num_warmup_steps) / float(num_training_steps - num_warmup_steps)
         progress = min(1.0, max(0.0, progress))
         cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
         return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
 
     return LambdaLR(optimizer, lr_lambda)
+
 
 
 @torch.no_grad()
@@ -163,10 +167,17 @@ def train(args):
         weight_decay=0.01
     )
 
+    # Calculate effective warmup steps (capped so it can never exceed run length)
+    if args.warmup_steps is not None:
+        warmup_steps = min(args.warmup_steps, args.max_steps)
+    else:
+        warmup_steps = max(1, int(args.max_steps * args.warmup_ratio))
+    print(f"📈 LR Schedule: Peak LR = {args.lr:.2e}, Min LR = {args.min_lr:.2e}, Warmup = {warmup_steps} steps, Total = {args.max_steps} steps")
+
     min_lr_ratio = args.min_lr / args.lr if args.lr > 0 else 0.1
     scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
-        num_warmup_steps=args.warmup_steps,
+        num_warmup_steps=warmup_steps,
         num_training_steps=args.max_steps,
         min_lr_ratio=min_lr_ratio
     )
@@ -296,14 +307,15 @@ def train(args):
         scheduler.step()
         step += 1
 
-        # Log training loss every log_interval steps
-        if step % args.log_interval == 0:
+        # Log training loss & LR: first 20 steps (or first 20 steps of resume segment), and every log_interval steps
+        if step <= 20 or (step - start_step) <= 20 or step % args.log_interval == 0:
             avg_train_loss = (loss_accum / max(1, accum_count)).item()
             loss_accum.zero_()
             accum_count = 0
             current_lr = scheduler.get_last_lr()[0]
             elapsed = time.time() - t0
-            print(f"Step {step:06d}/{args.max_steps} | Train Loss: {avg_train_loss:.4f} | LR: {current_lr:.2e} | Elapsed: {elapsed:.1f}s")
+            print(f"Step {step:06d}/{args.max_steps} | Train Loss: {avg_train_loss:.4f} | LR: {current_lr:.6e} | Elapsed: {elapsed:.1f}s")
+
 
         # Evaluate and log validation metrics every eval_interval steps
         if step % args.eval_interval == 0 and val_loader is not None:
@@ -359,6 +371,22 @@ def train(args):
             )
             ids_to_midi(sample_ids, vocab, output_path=sample_path)
 
+    # Always save final and latest checkpoint at the end of training
+    if step > start_step:
+        final_ckpt = checkpoint_dir / f"checkpoint_step_{step}.pt"
+        latest_ckpt = checkpoint_dir / "checkpoint_latest.pt"
+        state = {
+            "step": step,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "best_val_loss": best_val_loss,
+            "config": vars(args)
+        }
+        torch.save(state, final_ckpt)
+        torch.save(state, latest_ckpt)
+        print(f"💾 Final checkpoint saved to: {final_ckpt} and {latest_ckpt}")
+
     csv_file.close()
     print("🎉 Training Complete!")
 
@@ -377,7 +405,8 @@ if __name__ == "__main__":
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout probability")
     parser.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate")
     parser.add_argument("--min_lr", type=float, default=3e-5, help="Minimum learning rate")
-    parser.add_argument("--warmup_steps", type=int, default=500, help="Linear warmup steps")
+    parser.add_argument("--warmup_steps", type=int, default=None, help="Linear warmup steps (defaults to warmup_ratio * max_steps)")
+    parser.add_argument("--warmup_ratio", type=float, default=0.05, help="Warmup fraction of total steps if warmup_steps is omitted")
     parser.add_argument("--max_steps", type=int, default=50000, help="Maximum training steps")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pt to resume training")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
@@ -390,3 +419,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     train(args)
+

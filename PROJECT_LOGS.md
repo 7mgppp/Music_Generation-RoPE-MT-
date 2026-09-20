@@ -140,8 +140,21 @@ This document tracks all changes, bug fixes, module implementations, architectur
   - Result: ✅ Overfit test passed, driving loss to $0.0152$.
   - Sample generated and saved to: `checkpoints/samples/sample_overfit.mid`.
 
+### 3. LR Scheduler Refinements & Resume Verification
+- **Dynamic Warmup & Decay**:
+  - Implemented automatic warmup calculation (`args.warmup_ratio = 0.05` default), strictly capped by `min(warmup_steps, max_steps)`.
+  - Added per-step progress tracking for the first 20 steps of any training or resumed run.
+  - Verified cosine decay bottoms out exactly at `min_lr` on the final step.
+- **Resume Test (100 -> 120 Steps)**:
+  - Initial 100-step run saved `checkpoint_step_100.pt` and `checkpoint_latest.pt` (peaked at `3.00e-4` at step 10, decayed to `3.00e-5` at step 100).
+  - Resumed from `checkpoint_latest.pt` to step 120: restored state at step 100, smoothly resumed step counter from 101 to 120, and decayed LR down to `3.00e-5` at step 120.
+- **Standalone Generation Verification (`generate.py`)**:
+  - Built `generate.py` with checkpoint auto-loading, prompt priming, top-$k$/top-$p$ nucleus sampling, and direct MIDI export.
+  - Successfully generated 129 tokens and exported `smoke_generated.mid` end-to-end.
+
 ---
 
 ## 📅 Stage 5: Inference CLI, Generation Script & Documentation
-*Status: Pending*
+*Status: In Progress*
+
 
