@@ -1,4 +1,4 @@
-#MuseRoPE - Music Genration with Rotary Position Embeddings
+## MuseRoPE - Music Genration with Rotary Position Embeddings
 A decoder-only Transformer for autoregressive symbolic music generation (classical solo piano MIDI), trained on the [MAESTRO v3.0.0 Dataset](https://magenta.tensorflow.org/datasets/maestro).
 
 The model features custom **Rotary Position Embeddings (RoPE)**, a **MidiTok REMI + BPE** tokenization pipeline, and **offline pitch-shift data augmentation**, compressing musical representations while preserving long-range harmonic and temporal structure.
