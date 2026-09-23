@@ -1,7 +1,8 @@
 """
 Training Pipeline for Symbolic Music Generation with RoPE Transformer (RoPE-MT)
-Supports automatic device selection (CUDA -> MPS -> CPU), gradient accumulation,
-warmup + cosine decay, periodic checkpointing, CSV logging, and sample generation.
+Supports MidiTok (REMI + BPE), automatic device selection (CUDA -> MPS -> CPU),
+gradient accumulation, warmup + cosine decay, periodic checkpointing, CSV logging,
+and sample generation.
 """
 
 import os
@@ -25,10 +26,10 @@ from torch.optim.lr_scheduler import LambdaLR
 # Add repository root to path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from Data.vocab import MusicVocab
-from Data.dataset import create_music_dataloaders
+from miditok import REMI
+import symusic
+from Data.dataset_miditok import create_miditok_dataloaders
 from Model.MusicTransformer import MusicTransformer
-from Postprocessing.to_midi import ids_to_midi
 
 
 def get_device() -> torch.device:
@@ -66,7 +67,6 @@ def get_cosine_schedule_with_warmup(
     return LambdaLR(optimizer, lr_lambda)
 
 
-
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
@@ -74,16 +74,16 @@ def evaluate(
     criterion: nn.Module,
     vocab_size: int,
     device: torch.device,
-    max_eval_batches: int = 50
+    max_eval_batches: Optional[int] = 50
 ) -> Dict[str, float]:
-    """Evaluate validation loss and perplexity."""
+    """Evaluate model loss and perplexity on validation set."""
     model.eval()
     total_loss = 0.0
     total_tokens = 0
     batches_evaluated = 0
 
-    for batch in val_loader:
-        if batches_evaluated >= max_eval_batches:
+    for batch_idx, batch in enumerate(val_loader):
+        if max_eval_batches and batch_idx >= max_eval_batches:
             break
 
         input_ids = batch["input_ids"].to(device, non_blocking=False)
@@ -119,13 +119,13 @@ def train(args):
     samples_dir = checkpoint_dir / "samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Load Vocabulary
+    # 1. Load MidiTok Tokenizer
     vocab_path = Path(args.vocab_path)
     if not vocab_path.exists():
-        raise FileNotFoundError(f"Vocabulary file not found at {vocab_path}")
-    vocab = MusicVocab.load(vocab_path)
-    vocab_size = len(vocab)
-    print(f"📖 Loaded vocabulary of size: {vocab_size} from {vocab_path}")
+        raise FileNotFoundError(f"Tokenizer file not found at {vocab_path}")
+    tokenizer = REMI(params=vocab_path)
+    vocab_size = len(tokenizer)
+    print(f"📖 Loaded MidiTok REMI BPE tokenizer of size: {vocab_size} from {vocab_path}")
 
     # 2. Build Model
     model = MusicTransformer(
@@ -138,27 +138,32 @@ def train(args):
         max_seq_len=args.seq_len
     ).to(device)
 
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"🧠 Initialized MusicTransformer: {total_params:,} trainable parameters")
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"🧠 Music Transformer Architecture Initialized:")
+    print(f"   - Total Parameters:     {total_params:,}")
+    print(f"   - Trainable Parameters: {trainable_params:,}")
+    print(f"   - Context Window:       {args.seq_len} tokens")
 
-    # 3. DataLoaders
-    print(f"📂 Loading tokenized dataset from: {args.data_dir} ...")
-    loaders = create_music_dataloaders(
+    # 3. Data Loaders
+    print(f"📂 Loading dataset from: {args.data_dir} ...")
+    loaders = create_miditok_dataloaders(
         data_dir=args.data_dir,
-        vocab=vocab,
+        tokenizer=tokenizer,
         max_seq_len=args.seq_len,
         batch_size=args.batch_size,
-        num_workers=0
+        raw_midi_dir=args.raw_midi_dir,
     )
 
-    train_loader = loaders.get("train")
+    train_loader = loaders["train"]
     val_loader = loaders.get("val")
 
-    if train_loader is None or len(train_loader) == 0:
-        raise RuntimeError("Train DataLoader is empty. Please check data_dir.")
-    print(f"📊 Dataset splits: {len(train_loader)} train batches, {len(val_loader) if val_loader else 0} val batches.")
+    print(f"📊 Training chunks: {len(train_loader.dataset):,} | Batches: {len(train_loader):,} (batch_size={args.batch_size})")
+    if val_loader:
+        print(f"📊 Validation chunks: {len(val_loader.dataset):,} | Batches: {len(val_loader):,}")
 
-    # 4. Optimizer, Scheduler, and Loss
+    # 4. Loss & Optimizer
+    criterion = nn.CrossEntropyLoss(ignore_index=-100)
     optimizer = AdamW(
         model.parameters(),
         lr=args.lr,
@@ -167,7 +172,7 @@ def train(args):
         weight_decay=0.01
     )
 
-    # Calculate effective warmup steps (capped so it can never exceed run length)
+    # 5. Learning Rate Scheduler
     if args.warmup_steps is not None:
         warmup_steps = min(args.warmup_steps, args.max_steps)
     else:
@@ -182,155 +187,100 @@ def train(args):
         min_lr_ratio=min_lr_ratio
     )
 
-    criterion = nn.CrossEntropyLoss(ignore_index=-100)
-
-    # 5. Resume from Checkpoint if specified
+    # 6. Resume from Checkpoint if specified
     start_step = 0
     best_val_loss = float("inf")
 
-    if args.resume:
-        resume_path = Path(args.resume)
-        if resume_path.exists():
-            print(f"🔄 Resuming from checkpoint: {resume_path}")
-            checkpoint = torch.load(resume_path, map_location=device)
-            model.load_state_dict(checkpoint["model_state_dict"])
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            if "scheduler_state_dict" in checkpoint and checkpoint["scheduler_state_dict"] is not None:
-                scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            start_step = checkpoint.get("step", 0)
-            best_val_loss = checkpoint.get("best_val_loss", float("inf"))
-            print(f"Loaded checkpoint at step {start_step} (best val loss: {best_val_loss:.4f})")
-        else:
-            print(f"Warning: Checkpoint {resume_path} not found. Starting from scratch.")
+    if args.resume and Path(args.resume).exists():
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        start_step = ckpt.get("step", 0)
+        best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        print(f"🔄 Resumed training from step {start_step} (Best Val Loss: {best_val_loss:.4f})")
 
-    # 6. CSV Logging setup
-    csv_log_path = checkpoint_dir / "train_log.csv"
-    csv_file_exists = csv_log_path.exists() and not args.overfit_batch
-    csv_file = open(csv_log_path, mode="a" if csv_file_exists else "w", newline="", encoding="utf-8")
+    # 7. CSV Logger setup
+    log_file_path = checkpoint_dir / "train_log.csv"
+    is_new_log = not log_file_path.exists()
+    csv_file = open(log_file_path, "a", newline="")
     csv_writer = csv.writer(csv_file)
-    if not csv_file_exists:
-        csv_writer.writerow(["step", "train_loss", "val_loss", "val_perplexity", "learning_rate", "time_sec"])
-        csv_file.flush()
+    if is_new_log:
+        csv_writer.writerow(["step", "epoch", "train_loss", "val_loss", "val_ppl", "lr", "tokens_per_sec", "time_elapsed_sec"])
 
-    # 7. Initial Loss Verification Check (ln(vocab_size))
-    model.eval()
-    with torch.no_grad():
-        first_batch = next(iter(train_loader))
-        init_inp = first_batch["input_ids"].to(device, non_blocking=False)
-        init_tgt = first_batch["target_ids"].to(device, non_blocking=False)
-        init_logits = model(init_inp)
-        init_loss = criterion(init_logits.view(-1, vocab_size), init_tgt.view(-1)).item()
-        theoretical_loss = math.log(vocab_size)
-        print(f"\n🔍 [Initial Sanity Check] Initial Batch Loss: {init_loss:.4f} | Theoretical ln(V): {theoretical_loss:.4f}")
-        print(f"   (Difference: {abs(init_loss - theoretical_loss):.4f} - Model is correctly initialized)\n")
-
+    # 8. Training Loop
+    print(f"\n🚀 Starting training for {args.max_steps} steps (Grad Accum={args.grad_accum}, Effective Batch={args.batch_size * args.grad_accum}) ...")
     model.train()
 
-    # --- Mode A: Overfit Single Batch ---
-    if args.overfit_batch:
-        print("🎯 --- OVERFIT BATCH MODE ACTIVATED ---")
-        print("Training exclusively on 1 fixed batch to verify model capacity & gradient flow...")
-
-        fixed_batch = next(iter(train_loader))
-        fixed_inp = fixed_batch["input_ids"].to(device, non_blocking=False)
-        fixed_tgt = fixed_batch["target_ids"].to(device, non_blocking=False)
-
-        overfit_optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
-        overfit_steps = min(args.max_steps, 300)
-
-        for step in range(1, overfit_steps + 1):
-            overfit_optimizer.zero_grad()
-            logits = model(fixed_inp)
-            loss = criterion(logits.view(-1, vocab_size), fixed_tgt.view(-1))
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            overfit_optimizer.step()
-
-            if step % 25 == 0 or step == 1:
-                print(f"[Overfit Step {step:03d}/{overfit_steps}] Loss: {loss.item():.4f}")
-
-        final_loss = loss.item()
-        print(f"\n🏁 Overfit Test Finished: Final Loss = {final_loss:.4f}")
-        assert final_loss < 0.2, f"Overfit test failed! Loss {final_loss:.4f} did not converge below 0.2."
-        print("✅ OVERFIT TEST PASSED! The model successfully memorized the batch.")
-
-        # Generate sample from overfitted batch
-        sample_path = samples_dir / "sample_overfit.mid"
-        print(f"🎼 Generating sample MIDI to: {sample_path}")
-        sample_ids = model.generate(
-            prompt_ids=[vocab.bos_id],
-            max_generate_len=128,
-            temperature=0.8,
-            top_k=20,
-            top_p=0.9,
-            eos_id=vocab.eos_id,
-            device=device
-        )
-        ids_to_midi(sample_ids, vocab, output_path=sample_path)
-        csv_file.close()
-        return
-
-    # --- Mode B: Standard Training Loop ---
-    print(f"🚀 Starting training from step {start_step + 1} to {args.max_steps}...")
     step = start_step
-    data_iter = iter(train_loader)
-    loss_accum = torch.zeros(1, device=device)
-    accum_count = 0
+    epoch = 0
     t0 = time.time()
+    accum_loss_tracker = 0.0
+    accum_steps_count = 0
+
+    train_iter = iter(train_loader)
 
     while step < args.max_steps:
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
+        step_loss = 0.0
 
-        for _ in range(args.grad_accum):
+        for micro_step in range(args.grad_accum):
             try:
-                batch = next(data_iter)
+                batch = next(train_iter)
             except StopIteration:
-                data_iter = iter(train_loader)
-                batch = next(data_iter)
+                epoch += 1
+                train_iter = iter(train_loader)
+                batch = next(train_iter)
 
             input_ids = batch["input_ids"].to(device, non_blocking=False)
             target_ids = batch["target_ids"].to(device, non_blocking=False)
 
             logits = model(input_ids)
             loss = criterion(logits.view(-1, vocab_size), target_ids.view(-1))
+            
+            # Divide loss by grad_accum for correct backward gradient scale
+            (loss / args.grad_accum).backward()
 
-            scaled_loss = loss / args.grad_accum
-            scaled_loss.backward()
+            # Accumulate true per-token mean cross entropy loss for this optimizer step
+            step_loss += loss.item() / args.grad_accum
 
-            # Accumulate detached loss tensor on device (no .item() sync per step)
-            loss_accum += loss.detach()
-            accum_count += 1
-
-        # Gradient clipping and optimizer step
+        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
         optimizer.step()
         scheduler.step()
         step += 1
 
-        # Log training loss & LR: first 20 steps (or first 20 steps of resume segment), and every log_interval steps
+        accum_loss_tracker += step_loss
+        accum_steps_count += 1
+
+        # Log training loss: first 20 steps (and every log_interval thereafter)
         if step <= 20 or (step - start_step) <= 20 or step % args.log_interval == 0:
-            avg_train_loss = (loss_accum / max(1, accum_count)).item()
-            loss_accum.zero_()
-            accum_count = 0
+            avg_train_loss = accum_loss_tracker / max(1, accum_steps_count)
+            accum_loss_tracker = 0.0
+            accum_steps_count = 0
             current_lr = scheduler.get_last_lr()[0]
             elapsed = time.time() - t0
+
             print(f"Step {step:06d}/{args.max_steps} | Train Loss: {avg_train_loss:.4f} | LR: {current_lr:.6e} | Elapsed: {elapsed:.1f}s")
+            csv_writer.writerow([step, epoch, f"{avg_train_loss:.4f}", "", "", f"{current_lr:.6e}", "", f"{elapsed:.1f}"])
+            csv_file.flush()
 
-
-        # Evaluate and log validation metrics every eval_interval steps
-        if step % args.eval_interval == 0 and val_loader is not None:
+        # Validation Evaluation
+        if val_loader and step % args.eval_interval == 0:
+            print(f"\n🔍 Evaluating on Validation Set at step {step} ...")
             val_metrics = evaluate(model, val_loader, criterion, vocab_size, device)
             val_loss = val_metrics["val_loss"]
             val_ppl = val_metrics["perplexity"]
-            current_lr = scheduler.get_last_lr()[0]
-            elapsed = time.time() - t0
 
-            print(f"✨ [Validation @ Step {step}] Val Loss: {val_loss:.4f} | Perplexity: {val_ppl:.2f}")
+            print(f"   Validation Loss: {val_loss:.4f} | Perplexity: {val_ppl:.2f}\n")
 
-            csv_writer.writerow([step, f"{avg_train_loss:.4f}", f"{val_loss:.4f}", f"{val_ppl:.4f}", f"{current_lr:.6e}", f"{elapsed:.1f}"])
+            csv_writer.writerow([step, epoch, "", f"{val_loss:.4f}", f"{val_ppl:.2f}", f"{scheduler.get_last_lr()[0]:.6e}", "", f"{time.time() - t0:.1f}"])
             csv_file.flush()
 
-            # Save best model
+            # Save Best Model
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_path = checkpoint_dir / "best_model.pt"
@@ -360,16 +310,21 @@ def train(args):
         if step % args.sample_interval == 0:
             sample_path = samples_dir / f"sample_step_{step}.mid"
             print(f"🎼 Generating periodic sample to: {sample_path} ...")
-            sample_ids = model.generate(
-                prompt_ids=[vocab.bos_id],
-                max_generate_len=256,
-                temperature=0.9,
-                top_k=40,
-                top_p=0.9,
-                eos_id=vocab.eos_id,
-                device=device
-            )
-            ids_to_midi(sample_ids, vocab, output_path=sample_path)
+            model.eval()
+            with torch.no_grad():
+                sample_ids = model.generate(
+                    prompt_ids=[tokenizer["BOS_None"]],
+                    max_generate_len=args.seq_len,
+                    temperature=0.9,
+                    top_k=40,
+                    top_p=0.9,
+                    eos_id=tokenizer["EOS_None"],
+                    device=device
+                )
+            score = tokenizer.decode([sample_ids])
+            score.dump_midi(str(sample_path))
+            print(f"✨ Periodic sample saved to {sample_path}")
+            model.train()
 
     # Always save final and latest checkpoint at the end of training
     if step > start_step:
@@ -393,11 +348,12 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Music Transformer (RoPE-MT)")
-    parser.add_argument("--data_dir", type=str, default="Data/tokenized", help="Path to tokenized dataset directory")
-    parser.add_argument("--vocab_path", type=str, default="vocab/vocab.json", help="Path to vocab.json")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size per step")
-    parser.add_argument("--grad_accum", type=int, default=4, help="Gradient accumulation steps")
-    parser.add_argument("--seq_len", type=int, default=512, help="Sequence length (context window)")
+    parser.add_argument("--data_dir", type=str, default="Data/tokenized_remi", help="Path to tokenized dataset directory")
+    parser.add_argument("--raw_midi_dir", type=str, default="Data/raw/maestro-v3.0.0", help="Path to raw MAESTRO dataset directory")
+    parser.add_argument("--vocab_path", type=str, default="vocab/miditok_remi_bpe.json", help="Path to MidiTok tokenizer JSON")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size per step")
+    parser.add_argument("--grad_accum", type=int, default=8, help="Gradient accumulation steps")
+    parser.add_argument("--seq_len", type=int, default=1024, help="Sequence length (context window)")
     parser.add_argument("--d_model", type=int, default=512, help="Model hidden dimension")
     parser.add_argument("--n_heads", type=int, default=8, help="Number of attention heads")
     parser.add_argument("--n_layers", type=int, default=6, help="Number of decoder layers")
@@ -409,14 +365,12 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_ratio", type=float, default=0.05, help="Warmup fraction of total steps if warmup_steps is omitted")
     parser.add_argument("--max_steps", type=int, default=50000, help="Maximum training steps")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pt to resume training")
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints_remi", help="Directory to save checkpoints")
     parser.add_argument("--log_interval", type=int, default=50, help="Steps between training loss logs")
     parser.add_argument("--eval_interval", type=int, default=500, help="Steps between validation evaluations")
     parser.add_argument("--save_interval", type=int, default=500, help="Steps between checkpoints")
     parser.add_argument("--sample_interval", type=int, default=2000, help="Steps between sample MIDI generations")
-    parser.add_argument("--overfit_batch", action="store_true", help="Run single-batch memorization test")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
     args = parser.parse_args()
     train(args)
-
