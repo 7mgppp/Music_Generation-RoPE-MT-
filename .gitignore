@@ -18,6 +18,8 @@ checkpoints*/
 generated*.txt
 generated*.mid
 *.mid
+!samples/*.mid
+!remi_primed_t07.mid
 
 # Dataset Directories
 Data/raw/
